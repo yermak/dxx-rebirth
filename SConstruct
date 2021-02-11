@@ -1369,6 +1369,23 @@ static void terminate_handler()
 	char b[1] = {0};
 	if (!PHYSFS_init(""))
 		return 1;
+	{
+		const char *r = PHYSFS_getRealDir("");
+		(void)r;
+	}
+	PHYSFS_isDirectory("");
+	{
+		const char *sep = PHYSFS_getDirSeparator();
+		(void)sep;
+	}
+	{
+		const char *dir = PHYSFS_getBaseDir();
+		(void)dir;
+	}
+	{
+		const char *dir = PHYSFS_getUserDir();
+		(void)dir;
+	}
 	f = PHYSFS_openWrite("a");
 	PHYSFS_sint64 w = PHYSFS_write(f, b, 1, 1);
 	(void)w;
@@ -1377,9 +1394,12 @@ static void terminate_handler()
 	PHYSFS_sint64 r = PHYSFS_read(f, b, 1, 1);
 	(void)r;
 	PHYSFS_close(f);
+	PHYSFS_mount("", nullptr, 0);
+	PHYSFS_unmount("");
+	PHYSFS_delete("");
 '''
 		l = ['physfs']
-		successflags = {'LIBS' : l}
+		successflags = self.pkgconfig.merge(context, self.msgprefix, self.user_settings, 'physfs', 'physfs', {'LIBS' : l})
 		e = self._soft_check_system_library(context, header=_header, main=main, lib='physfs', successflags=successflags)
 		if not e:
 			return
@@ -4666,7 +4686,6 @@ class DXXArchive(DXXCommon):
 	class DarwinPlatformSettings(DXXCommon.DarwinPlatformSettings):
 		get_platform_objects = LazyObjectConstructor.create_lazy_object_getter((
 			'common/arch/cocoa/messagebox.mm',
-			'common/arch/cocoa/SDLMain.m',
 		))
 
 	def __init__(self,user_settings):

@@ -84,12 +84,16 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #if DXX_USE_UDP
 #include "net_udp.h"
 #endif
+#include "d_array.h"
 #include "d_enumerate.h"
 #include "d_levelstate.h"
 #include "d_range.h"
+#include "d_zip.h"
 
 #include "partial_range.h"
 #include <utility>
+
+#define array_snprintf(array,fmt,arg1,...)	std::snprintf(array.data(), array.size(), fmt, arg1, ## __VA_ARGS__)
 
 constexpr std::integral_constant<int8_t, -1> owner_none{};
 
@@ -101,10 +105,15 @@ static void multi_process_data(playernum_t pnum, const ubyte *dat, uint_fast32_t
 static void multi_update_objects_for_non_cooperative();
 static void multi_restore_game(unsigned slot, unsigned id);
 static void multi_save_game(unsigned slot, unsigned id, const d_game_unique_state::savegame_description &desc);
-}
-}
 static void multi_add_lifetime_killed();
+#if !(!defined(RELEASE) && defined(DXX_BUILD_DESCENT_II))
+static void multi_add_lifetime_kills(int count);
+#endif
+}
+}
+namespace {
 static void multi_send_heartbeat();
+}
 #if defined(DXX_BUILD_DESCENT_II)
 namespace dsx {
 namespace {
@@ -114,8 +123,10 @@ static void multi_send_drop_flag(vmobjptridx_t objnum,int seed);
 }
 }
 #endif
+namespace {
 static void multi_send_ranking(uint8_t);
 static void multi_send_gmode_update();
+}
 namespace dcx {
 namespace {
 static int imulti_new_game; // to prep stuff for level only when starting new game
@@ -127,13 +138,11 @@ static void multi_send_quit();
 }
 DEFINE_SERIAL_UDT_TO_MESSAGE(shortpos, s, (s.bytemat, s.xo, s.yo, s.zo, s.segment, s.velx, s.vely, s.velz));
 }
+namespace {
 static playernum_t multi_who_is_master();
 static void multi_show_player_list();
 static void multi_send_message();
-
-#if !(!defined(RELEASE) && defined(DXX_BUILD_DESCENT_II))
-static void multi_add_lifetime_kills(int count);
-#endif
+}
 
 //
 // Global variables
@@ -243,6 +252,7 @@ constexpr int message_length[] = {
 #define define_message_length(NAME,SIZE)	(SIZE),
 	for_each_multiplayer_command(define_message_length)
 };
+
 }
 
 }
@@ -405,22 +415,6 @@ void reset_network_objects()
 	object_owner.fill(-1);
 }
 
-int multi_objnum_is_past(objnum_t objnum)
-{
-	switch (multi_protocol)
-	{
-		case MULTI_PROTO_UDP:
-#if DXX_USE_UDP
-			return net_udp_objnum_is_past(objnum);
-			break;
-#endif
-		default:
-			(void)objnum;
-			Error("Protocol handling missing in multi_objnum_is_past\n");
-			break;
-	}
-}
-
 namespace dsx {
 
 //
@@ -434,17 +428,8 @@ kmatrix_result multi_endlevel_score()
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
 	auto &vmobjptr = Objects.vmptr;
-	int old_connect=0, game_wind_visible = 0;
+	int old_connect = 0;
 
-	// If there still is a Game_wind and it's suspended (usually both should be the case), bring it up again so host can still take actions of the game
-	if (Game_wind)
-	{
-		if (!window_is_visible(*Game_wind))
-		{
-			game_wind_visible = 1;
-			window_set_visible(*Game_wind, 1);
-		}
-	}
 	// Save connect state and change to new connect state
 	if (Game_mode & GM_NETWORK)
 	{
@@ -505,11 +490,6 @@ kmatrix_result multi_endlevel_score()
 		player_info.powerup_flags &= clear_flags;
 		player_info.KillGoalCount = 0;
 	}
-
-	// hide Game_wind again if we brought it up
-	if (Game_wind && game_wind_visible)
-		window_set_visible(*Game_wind, 0);
-
 	return rval;
 }
 
@@ -674,12 +654,14 @@ static void net_destroy_controlcen(object_array &Objects)
 {
 	print_kill_goal_tables(Objects.vcptr);
 	HUD_init_message_literal(HM_MULTI, "The control center has been destroyed!");
-	net_destroy_controlcen(obj_find_first_of_type(Objects.vmptridx, OBJ_CNTRLCEN));
+	net_destroy_controlcen_object(obj_find_first_of_type(Objects.vmptridx, OBJ_CNTRLCEN));
 }
 
 }
 
 }
+
+namespace {
 
 static const char *prepare_kill_name(const playernum_t pnum, char (&buf)[(CALLSIGN_LEN*2)+4])
 {
@@ -690,6 +672,8 @@ static const char *prepare_kill_name(const playernum_t pnum, char (&buf)[(CALLSI
 	}
 	else
 		return static_cast<const char *>(vcplayerptr(pnum)->callsign);
+}
+
 }
 
 namespace dsx {
@@ -945,22 +929,6 @@ static void multi_compute_kill(const imobjptridx_t killer, object &killed)
 
 }
 
-void multi_do_protocol_frame(int force, int listen)
-{
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			net_udp_do_frame(force, listen);
-			break;
-#endif
-		default:
-			(void)force; (void)listen;
-			Error("Protocol handling missing in multi_do_protocol_frame\n");
-			break;
-	}
-}
-
 window_event_result multi_do_frame()
 {
 	static d_time_fix lasttime;
@@ -1016,7 +984,7 @@ window_event_result multi_do_frame()
 		multi_check_robot_timeout();
 	}
 
-	multi_do_protocol_frame(0, 1);
+	multi::dispatch->do_protocol_frame(0, 1);
 
 	return multi_quit_game ? window_event_result::close : window_event_result::handled;
 }
@@ -1111,21 +1079,8 @@ void multi_leave_game()
 	}
 
 	multi_send_quit();
+	multi::dispatch->leave_game();
 
-	if (Game_mode & GM_NETWORK)
-	{
-		switch (multi_protocol)
-		{
-#if DXX_USE_UDP
-			case MULTI_PROTO_UDP:
-				net_udp_leave_game();
-				break;
-#endif
-			default:
-				Error("Protocol handling missing in multi_leave_game\n");
-				break;
-		}
-	}
 #if defined(DXX_BUILD_DESCENT_I)
 	plyr_save_stats();
 #endif
@@ -1134,6 +1089,8 @@ void multi_leave_game()
 }
 
 }
+
+namespace {
 
 void multi_show_player_list()
 {
@@ -1147,56 +1104,6 @@ void multi_show_player_list()
 	Show_kill_list = 1;
 }
 
-int multi_endlevel(int *const secret)
-{
-	int result = 0;
-
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			result = net_udp_endlevel(secret);
-			break;
-#endif
-		default:
-			(void)secret;
-			Error("Protocol handling missing in multi_endlevel\n");
-			break;
-	}
-
-	return(result);
-}
-
-namespace dsx {
-
-multi_endlevel_poll *get_multi_endlevel_poll2()
-{
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			return net_udp_kmatrix_poll2;
-#endif
-		default:
-			throw std::logic_error("Protocol handling missing in multi_endlevel_poll2");
-	}
-}
-
-}
-
-void multi_send_endlevel_packet()
-{
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			net_udp_send_endlevel_packet();
-			break;
-#endif
-		default:
-			Error("Protocol handling missing in multi_send_endlevel_packet\n");
-			break;
-	}
 }
 
 //
@@ -1338,19 +1245,7 @@ namespace {
 
 static void kick_player(const player &plr, netplayer_info &nplr)
 {
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			net_udp_dump_player(nplr.protocol.udp.addr, DUMP_KICKED);
-			break;
-#endif
-		default:
-			(void)nplr;
-			Error("Protocol handling missing in multi_send_message_end\n");
-			break;
-	}
-
+	multi::dispatch->kick_player(nplr.protocol.udp.addr, DUMP_KICKED);
 	HUD_init_message(HM_MULTI, "Dumping %s...", static_cast<const char *>(plr.callsign));
 	multi_message_index = 0;
 	multi_sending_message[Player_num] = msgsend_none;
@@ -1517,7 +1412,7 @@ static void multi_send_message_end(fvmobjptr &vmobjptr, control_info &Controls)
 			HUD_init_message(HM_MULTI, "Only %s can kill the reactor this way!", static_cast<const char *>(Players[multi_who_is_master()].callsign));
 		else
 		{
-			net_destroy_controlcen(object_none);
+			net_destroy_controlcen_object(object_none);
 			multi_send_destroy_controlcen(object_none,Player_num);
 		}
 		multi_message_index = 0;
@@ -1632,12 +1527,11 @@ namespace {
 
 static void multi_do_fire(fvmobjptridx &vmobjptridx, const playernum_t pnum, const uint8_t *const buf)
 {
-	ubyte weapon;
 	sbyte flags;
 	vms_vector shot_orientation;
 
 	// Act out the actual shooting
-	weapon = static_cast<int>(buf[2]);
+	const uint8_t untrusted_raw_weapon = buf[2];
 
 	flags = buf[4];
 	icobjidx_t Network_laser_track = object_none;
@@ -1657,16 +1551,16 @@ static void multi_do_fire(fvmobjptridx &vmobjptridx, const playernum_t pnum, con
 	if (obj->type == OBJ_GHOST)
 		multi_make_ghost_player(pnum);
 
-	if (weapon == FLARE_ADJUST)
+	if (untrusted_raw_weapon == FLARE_ADJUST)
 		Laser_player_fire(obj, weapon_id_type::FLARE_ID, 6, 1, shot_orientation, object_none);
-	else
-	if (weapon >= MISSILE_ADJUST) {
-		int weapon_gun,remote_objnum;
-		const auto weapon_id = Secondary_weapon_to_weapon_info[weapon-MISSILE_ADJUST];
-		weapon_gun = Secondary_weapon_to_gun_num[weapon-MISSILE_ADJUST] + (flags & 1);
+	else if (const uint8_t untrusted_missile_adjusted_weapon = untrusted_raw_weapon - MISSILE_ADJUST; untrusted_missile_adjusted_weapon < MAX_SECONDARY_WEAPONS)
+	{
+		const auto weapon = secondary_weapon_index_t{untrusted_missile_adjusted_weapon};
+		const auto weapon_id = Secondary_weapon_to_weapon_info[weapon];
+		const auto weapon_gun = Secondary_weapon_to_gun_num[weapon] + (flags & 1);
 
 #if defined(DXX_BUILD_DESCENT_II)
-		if (weapon-MISSILE_ADJUST==GUIDED_INDEX)
+		if (weapon == secondary_weapon_index_t::GUIDED_INDEX)
 		{
 			Multi_is_guided=1;
 		}
@@ -1675,15 +1569,18 @@ static void multi_do_fire(fvmobjptridx &vmobjptridx, const playernum_t pnum, con
 		const auto &&objnum = Laser_player_fire(obj, weapon_id, weapon_gun, 1, shot_orientation, Network_laser_track);
 		if (buf[0] == MULTI_FIRE_BOMB)
 		{
-			remote_objnum = GET_INTEL_SHORT(buf + 18);
+			const auto remote_objnum = GET_INTEL_SHORT(buf + 18);
 			map_objnum_local_to_remote(objnum, remote_objnum, pnum);
 		}
 	}
-	else {
+	else if (const uint8_t untrusted_weapon = untrusted_raw_weapon; untrusted_weapon < MAX_PRIMARY_WEAPONS)
+	{
+		const auto weapon = primary_weapon_index_t{untrusted_weapon};
 		if (weapon == primary_weapon_index_t::FUSION_INDEX) {
 			obj->ctype.player_info.Fusion_charge = flags << 12;
 		}
-		if (weapon == weapon_id_type::LASER_ID) {
+		if (weapon == primary_weapon_index_t::LASER_INDEX)
+		{
 			auto &powerup_flags = obj->ctype.player_info.powerup_flags;
 			if (flags & LASER_QUAD)
 				powerup_flags |= PLAYER_FLAGS_QUAD_LASERS;
@@ -1698,6 +1595,8 @@ static void multi_do_fire(fvmobjptridx &vmobjptridx, const playernum_t pnum, con
 }
 
 }
+
+namespace {
 
 static void multi_do_message(const uint8_t *const cbuf)
 {
@@ -1726,6 +1625,8 @@ static void multi_do_message(const uint8_t *const cbuf)
 	digi_play_sample(SOUND_HUD_MESSAGE, F1_0);
 	HUD_init_message(HM_MULTI, "%c%c%s:%c%c %s", CC_COLOR, xrgb, static_cast<const char *>(vcplayerptr(pnum)->callsign), CC_COLOR, BM_XRGB(0, 31, 0), msgstart);
 	multi_sending_message[pnum] = msgsend_none;
+}
+
 }
 
 namespace dsx {
@@ -1896,6 +1797,8 @@ static void multi_do_player_deres(object_array &Objects, const playernum_t pnum,
 
 }
 
+namespace {
+
 /*
  * Process can compute a kill. If I am a Client this might be my own one (see multi_send_kill()) but with more specific data so I can compute my kill correctly.
  */
@@ -1945,6 +1848,8 @@ static void multi_do_kill(object_array &Objects, const uint8_t *const buf)
 		multi_send_bounty();
 }
 
+}
+
 namespace dsx {
 
 namespace {
@@ -1965,7 +1870,7 @@ static void multi_do_controlcen_destroy(fimobjptridx &imobjptridx, const uint8_t
 		else
 			HUD_init_message_literal(HM_MULTI, who == Player_num ? TXT_YOU_DEST_CONTROL : TXT_CONTROL_DESTROYED);
 
-		net_destroy_controlcen(objnum == object_none ? object_none : imobjptridx(objnum));
+		net_destroy_controlcen_object(objnum == object_none ? object_none : imobjptridx(objnum));
 	}
 }
 
@@ -2026,7 +1931,7 @@ static void multi_do_remobj(fvmobjptr &vmobjptr, const uint8_t *const buf)
 		return;
 	}
 
-	if (Network_send_objects && multi_objnum_is_past(local_objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(local_objnum))
 	{
 		Network_send_objnum = -1;
 	}
@@ -2083,23 +1988,13 @@ void multi_disconnect_player(const playernum_t pnum)
 	vmplayerptr(pnum)->connected = CONNECT_DISCONNECTED;
 	Netgame.players[pnum].connected = CONNECT_DISCONNECTED;
 
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			net_udp_disconnect_player(pnum);
-			break;
-#endif
-		default:
-			Error("Protocol handling missing in multi_disconnect_player\n");
-			break;
-	}
+	multi::dispatch->disconnect_player(pnum);
 
 	if (pnum == multi_who_is_master()) // Host has left - Quit game!
 	{
 		if (Game_wind)
 			window_set_visible(*Game_wind, 0);
-		nm_messagebox_str(nullptr, nm_messagebox_tie(TXT_OK), "Host left the game!");
+		nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie(TXT_OK), menu_subtitle{"Host left the game!"});
 		if (Game_wind)
 			window_set_visible(*Game_wind, 1);
 		multi_quit_game = 1;
@@ -2118,11 +2013,15 @@ void multi_disconnect_player(const playernum_t pnum)
 	}
 }
 
+namespace {
+
 static void multi_do_quit(const uint8_t *const buf)
 {
 	if (!(Game_mode & GM_NETWORK))
 		return;
 	multi_disconnect_player(static_cast<int>(buf[1]));
+}
+
 }
 
 namespace dsx {
@@ -2288,7 +2187,7 @@ static void multi_do_create_powerup(fvmobjptr &vmobjptr, fvmsegptridx &vmsegptri
 		return;
 	}
 
-	if (Network_send_objects && multi_objnum_is_past(my_objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(my_objnum))
 	{
 		Network_send_objnum = -1;
 	}
@@ -2323,6 +2222,8 @@ static void multi_do_play_sound(object_array &Objects, const playernum_t pnum, c
 }
 
 }
+
+namespace {
 
 static void multi_do_score(fvmobjptr &vmobjptr, const playernum_t pnum, const uint8_t *const buf)
 {
@@ -2361,6 +2262,8 @@ static void multi_do_trigger(const playernum_t pnum, const ubyte *buf)
 	check_trigger_sub(get_local_plrobj(), trigger, pnum,0);
 }
 
+}
+
 #if defined(DXX_BUILD_DESCENT_II)
 namespace dsx {
 
@@ -2374,7 +2277,7 @@ static void multi_do_effect_blowup(const playernum_t pnum, const ubyte *buf)
 	if (pnum >= N_players || pnum == Player_num)
 		return;
 
-	multi_do_protocol_frame(1, 0); // force packets to be sent, ensuring this packet will be attached to following MULTI_TRIGGER
+	multi::dispatch->do_protocol_frame(1, 0); // force packets to be sent, ensuring this packet will be attached to following MULTI_TRIGGER
 
 	const auto &&useg = vmsegptridx.check_untrusted(GET_INTEL_SHORT(&buf[2]));
 	if (!useg)
@@ -2435,6 +2338,8 @@ static void multi_do_drop_marker(object_array &Objects, fvmsegptridx &vmsegptrid
 }
 #endif
 
+namespace {
+
 static void multi_do_hostage_door_status(fvmsegptridx &vmsegptridx, wall_array &Walls, const uint8_t *const buf)
 {
 	// Update hit point status of a door
@@ -2442,12 +2347,13 @@ static void multi_do_hostage_door_status(fvmsegptridx &vmsegptridx, wall_array &
 	int count = 1;
 	fix hps;
 
-	wallnum_t wallnum = GET_INTEL_SHORT(buf + count);     count += 2;
+	const wallnum_t wallnum{GET_INTEL_SHORT(buf + count)};
+	count += 2;
 	hps = GET_INTEL_INT(buf + count);           count += 4;
 
 	auto &vmwallptr = Walls.vmptr;
 	auto &w = *vmwallptr(wallnum);
-	if (wallnum >= Walls.get_count() || hps < 0 || w.type != WALL_BLASTABLE)
+	if (hps < 0 || w.type != WALL_BLASTABLE)
 	{
 		Int3(); // Non-terminal, see Rob
 		return;
@@ -2455,6 +2361,8 @@ static void multi_do_hostage_door_status(fvmsegptridx &vmsegptridx, wall_array &
 
 	if (hps < w.hps)
 		wall_damage(vmsegptridx(w.segnum), w.sidenum, w.hps - hps);
+}
+
 }
 
 void multi_reset_stuff()
@@ -2583,7 +2491,7 @@ void multi_send_fire(int laser_gun, const laser_level level, int laser_flags, in
 	// provoke positional update if possible (20 times per second max. matches vulcan, the fastest firing weapon)
 	if (timer_query() >= (last_fireup_time+(F1_0/20)))
 	{
-		multi_do_protocol_frame(1, 0);
+		multi::dispatch->do_protocol_frame(1, 0);
 		last_fireup_time = timer_query();
 	}
 
@@ -2701,17 +2609,7 @@ void multi_send_endlevel_start()
 	if (Game_mode & GM_NETWORK)
 	{
 		get_local_player().connected = CONNECT_ESCAPE_TUNNEL;
-		switch (multi_protocol)
-		{
-#if DXX_USE_UDP
-			case MULTI_PROTO_UDP:
-				net_udp_send_endlevel_packet();
-				break;
-#endif
-			default:
-				Error("Protocol handling missing in multi_send_endlevel_start\n");
-				break;
-		}
+		multi::dispatch->send_endlevel_packet();
 	}
 }
 
@@ -2798,6 +2696,8 @@ void multi_send_player_deres(deres_type_t type)
 
 }
 
+namespace {
+
 void multi_send_message()
 {
 	int loc = 0;
@@ -2813,6 +2713,8 @@ void multi_send_message()
 		multi_send_data<MULTI_MESSAGE>(multibuf, loc, 0);
 		Network_message_reciever = -1;
 	}
+}
+
 }
 
 void multi_send_reappear()
@@ -2922,7 +2824,7 @@ void multi_send_remobj(const vmobjidx_t objnum)
 
 	multi_send_data(multibuf, 2);
 
-	if (Network_send_objects && multi_objnum_is_past(objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(objnum))
 	{
 		Network_send_objnum = -1;
 	}
@@ -3089,7 +2991,7 @@ void multi_send_create_powerup(const powerup_type_t powerup_type, const vcsegidx
 	//                                                                                                            Total =  19
 	multi_send_data(multibuf, 2);
 
-	if (Network_send_objects && multi_objnum_is_past(objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(objnum))
 	{
 		Network_send_objnum = -1;
 	}
@@ -3099,6 +3001,8 @@ void multi_send_create_powerup(const powerup_type_t powerup_type, const vcsegidx
 
 }
 
+namespace {
+
 static void multi_digi_play_sample(const int soundnum, const fix max_volume, const sound_stack once)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -3106,6 +3010,8 @@ static void multi_digi_play_sample(const int soundnum, const fix max_volume, con
 	if (Game_mode & GM_MULTI)
 		multi_send_play_sound(soundnum, max_volume, once);
 	digi_link_sound_to_object(soundnum, vcobjptridx(Viewer), 0, max_volume, once);
+}
+
 }
 
 void multi_digi_play_sample_once(int soundnum, fix max_volume)
@@ -3187,7 +3093,7 @@ void multi_send_effect_blowup(const vcsegidx_t segnum, const unsigned side, cons
 	//       not sending MULTI_TRIGGER and making puzzles or progress impossible.
 	int count = 0;
 
-	multi_do_protocol_frame(1, 0); // force packets to be sent, ensuring this packet will be attached to following MULTI_TRIGGER
+	multi::dispatch->do_protocol_frame(1, 0); // force packets to be sent, ensuring this packet will be attached to following MULTI_TRIGGER
 	
 	count += 1;
 	multi_command<MULTI_EFFECT_BLOWUP> multibuf;
@@ -3213,7 +3119,7 @@ void multi_send_hostage_door_status(const vcwallptridx_t w)
 
 	count += 1;
 	multi_command<MULTI_HOSTAGE_DOOR> multibuf;
-	PUT_INTEL_SHORT(&multibuf[count], static_cast<wallnum_t>(w));
+	PUT_INTEL_SHORT(&multibuf[count], static_cast<typename std::underlying_type<wallnum_t>::type>(wallnum_t{w}));
 	count += 2;
 	PUT_INTEL_INT(&multibuf[count], w->hps);  count += 4;
 
@@ -3234,7 +3140,7 @@ void multi_consistency_error(int reset)
 
 	if (Game_wind)
 		window_set_visible(*Game_wind, 0);
-	nm_messagebox_str(nullptr, nm_messagebox_tie(TXT_OK), TXT_CONSISTENCY_ERROR);
+	nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie(TXT_OK), menu_subtitle{TXT_CONSISTENCY_ERROR});
 	if (Game_wind)
 		window_set_visible(*Game_wind, 1);
 	count = 0;
@@ -3292,6 +3198,8 @@ uint16_t map_granted_flags_to_vulcan_ammo(const packed_spawn_granted_items p)
 		(grant & NETGRANT_VULCAN ? amount : 0);
 }
 
+namespace {
+
 static constexpr unsigned map_granted_flags_to_netflag(const packed_spawn_granted_items grant)
 {
 	return (grant_shift_helper(grant, BIT_NETGRANT_QUAD - BIT_NETFLAG_DOQUAD) & (NETFLAG_DOQUAD | NETFLAG_DOVULCAN | NETFLAG_DOSPREAD | NETFLAG_DOPLASMA | NETFLAG_DOFUSION))
@@ -3314,8 +3222,6 @@ assert_equal(map_granted_flags_to_netflag(NETGRANT_PLASMA | NETGRANT_AFTERBURNER
 assert_equal(map_granted_flags_to_netflag(NETGRANT_AFTERBURNER), NETFLAG_DOAFTERBURNER, "AFTERBURNER");
 assert_equal(map_granted_flags_to_netflag(NETGRANT_HEADLIGHT), NETFLAG_DOHEADLIGHT, "HEADLIGHT");
 #endif
-
-namespace {
 
 class update_item_state
 {
@@ -3584,27 +3490,6 @@ void multi_prep_level_player(void)
 	imulti_new_game=0;
 }
 
-}
-
-window_event_result multi_level_sync(void)
-{
-	switch (multi_protocol)
-	{
-#if DXX_USE_UDP
-		case MULTI_PROTO_UDP:
-			return net_udp_level_sync();
-			break;
-#endif
-		default:
-			Error("Protocol handling missing in multi_level_sync\n");
-			break;
-	}
-
-	return window_event_result::ignored;
-}
-
-namespace dsx {
-
 #if defined(DXX_BUILD_DESCENT_II)
 namespace {
 
@@ -3841,10 +3726,14 @@ void multi_update_objects_for_non_cooperative()
 
 }
 
+namespace {
+
 // Returns the Player_num of Master/Host of this game
 playernum_t multi_who_is_master()
 {
 	return 0;
+}
+
 }
 
 void change_playernum_to(const playernum_t new_Player_num)
@@ -3923,6 +3812,8 @@ void multi_send_drop_weapon(const vmobjptridx_t objp, int seed)
 	multi_send_data(multibuf, 2);
 }
 
+namespace {
+
 static void multi_do_drop_weapon(fvmobjptr &vmobjptr, const playernum_t pnum, const uint8_t *const buf)
 {
 	int ammo,remote_objnum,seed;
@@ -3936,6 +3827,8 @@ static void multi_do_drop_weapon(fvmobjptr &vmobjptr, const playernum_t pnum, co
 
 	if (objnum!=object_none)
 		objnum->ctype.powerup_info.count = ammo;
+}
+
 }
 
 #if defined(DXX_BUILD_DESCENT_II)
@@ -3955,11 +3848,13 @@ void multi_send_vulcan_weapon_ammo_adjust(const vmobjptridx_t objnum)
 
 	multi_send_data(multibuf, 2);
 
-	if (Network_send_objects && multi_objnum_is_past(objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(objnum))
 	{
 		Network_send_objnum = -1;
 	}
 }
+
+namespace {
 
 static void multi_do_vulcan_weapon_ammo_adjust(fvmobjptr &vmobjptr, const uint8_t *const buf)
 {
@@ -3986,7 +3881,7 @@ static void multi_do_vulcan_weapon_ammo_adjust(fvmobjptr &vmobjptr, const uint8_
 		return;
 	}
 
-	if (Network_send_objects && multi_objnum_is_past(local_objnum))
+	if (Network_send_objects && multi::dispatch->objnum_is_past(local_objnum))
 	{
 		Network_send_objnum = -1;
 	}
@@ -3994,8 +3889,6 @@ static void multi_do_vulcan_weapon_ammo_adjust(fvmobjptr &vmobjptr, const uint8_
 	const auto ammo = GET_INTEL_SHORT(buf + 4);
 		obj->ctype.powerup_info.count = ammo;
 }
-
-namespace {
 
 struct multi_guided_info
 {
@@ -4016,6 +3909,8 @@ void multi_send_guided_info(const object_base &miss, const char done)
 	create_shortpos_little(LevelSharedSegmentState, gi.sp, miss);
 	multi_serialize_write(0, gi);
 }
+
+namespace {
 
 static void multi_do_guided(d_level_unique_object_state &LevelUniqueObjectState, const playernum_t pnum, const uint8_t *const buf)
 {
@@ -4038,6 +3933,8 @@ static void multi_do_guided(d_level_unique_object_state &LevelUniqueObjectState,
 	update_object_seg(vmobjptr, LevelSharedSegmentState, LevelUniqueSegmentState, guided_missile);
 }
 
+}
+
 void multi_send_stolen_items ()
 {
 	multi_command<MULTI_STOLEN_ITEMS> multibuf;
@@ -4046,13 +3943,17 @@ void multi_send_stolen_items ()
 	multi_send_data(multibuf, 2);
 }
 
+namespace {
+
 static void multi_do_stolen_items(const uint8_t *const buf)
 {
 	auto &Stolen_items = LevelUniqueObjectState.ThiefState.Stolen_items;
 	std::copy_n(buf + 1, Stolen_items.size(), Stolen_items.begin());
 }
 
-void multi_send_wall_status_specific(const playernum_t pnum,uint16_t wallnum,ubyte type,ubyte flags,ubyte state)
+}
+
+void multi_send_wall_status_specific(const playernum_t pnum, wallnum_t wallnum, uint8_t type, uint8_t flags, uint8_t state)
 {
 	// Send wall states a specific rejoining player
 
@@ -4063,7 +3964,8 @@ void multi_send_wall_status_specific(const playernum_t pnum,uint16_t wallnum,uby
 
 	count++;
 	multi_command<MULTI_WALL_STATUS> multibuf;
-	PUT_INTEL_SHORT(&multibuf[count], wallnum);  count+=2;
+	PUT_INTEL_SHORT(&multibuf[count], static_cast<uint16_t>(wallnum));
+	count+=2;
 	multibuf[count]=type;                 count++;
 	multibuf[count]=flags;                count++;
 	multibuf[count]=state;                count++;
@@ -4071,11 +3973,13 @@ void multi_send_wall_status_specific(const playernum_t pnum,uint16_t wallnum,uby
 	multi_send_data_direct(multibuf, pnum, 2);
 }
 
+namespace {
+
 static void multi_do_wall_status(fvmwallptr &vmwallptr, const uint8_t *const buf)
 {
 	ubyte flag,type,state;
 
-	wallnum_t wallnum = GET_INTEL_SHORT(buf + 1);
+	const wallnum_t wallnum{GET_INTEL_SHORT(buf + 1)};
 	type=buf[3];
 	flag=buf[4];
 	state=buf[5];
@@ -4091,6 +3995,8 @@ static void multi_do_wall_status(fvmwallptr &vmwallptr, const uint8_t *const buf
 		digi_kill_sound_linked_to_segment(w.segnum, w.sidenum, SOUND_FORCEFIELD_HUM);
 		//digi_kill_sound_linked_to_segment(csegp-Segments,cside,SOUND_FORCEFIELD_HUM);
 	}
+}
+
 }
 #endif
 
@@ -4112,6 +4018,8 @@ void multi_send_kill_goal_counts()
 	}
 	multi_send_data(multibuf, 2);
 }
+
+namespace {
 
 static void multi_do_kill_goal_counts(fvmobjptr &vmobjptr, const uint8_t *const buf)
 {
@@ -4143,6 +4051,8 @@ static void multi_do_heartbeat (const ubyte *buf)
 	num = GET_INTEL_INT(buf + 1);
 
 	ThisLevelTime = d_time_fix(num);
+}
+
 }
 
 void multi_check_for_killgoal_winner ()
@@ -4190,9 +4100,9 @@ void multi_check_for_killgoal_winner ()
 	net_destroy_controlcen(Objects);
 }
 
-#if defined(DXX_BUILD_DESCENT_II)
 namespace dsx {
 
+#if defined(DXX_BUILD_DESCENT_II)
 // Sync our seismic time with other players
 void multi_send_seismic(fix duration)
 {
@@ -4202,11 +4112,15 @@ void multi_send_seismic(fix duration)
 	multi_send_data(multibuf, 2);
 }
 
+namespace {
+
 static void multi_do_seismic (const ubyte *buf)
 {
 	const fix duration = GET_INTEL_INT(&buf[1]);
 	LevelUniqueSeismicState.Seismic_disturbance_end_time = GameTime64 + duration;
 	digi_play_sample (SOUND_SEISMIC_DISTURBANCE_START, F1_0);
+}
+
 }
 
 void multi_send_light_specific (const playernum_t pnum, const vcsegptridx_t segnum, const uint8_t val)
@@ -4228,6 +4142,8 @@ void multi_send_light_specific (const playernum_t pnum, const vcsegptridx_t segn
 	}
 	multi_send_data_direct(multibuf, pnum, 2);
 }
+
+namespace {
 
 static void multi_do_light (const ubyte *buf)
 {
@@ -4263,6 +4179,8 @@ static void multi_do_flags(fvmobjptr &vmobjptr, const playernum_t pnum, const ui
 		vmobjptr(vcplayerptr(pnum)->objnum)->ctype.player_info.powerup_flags = player_flags(flags);
 }
 
+}
+
 void multi_send_flags (const playernum_t pnum)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -4282,16 +4200,14 @@ void multi_send_drop_blobs (const playernum_t pnum)
 	multi_send_data(multibuf, 0);
 }
 
+namespace {
+
 static void multi_do_drop_blob(fvmobjptr &vmobjptr, const playernum_t pnum)
 {
 	drop_afterburner_blobs (vmobjptr(vcplayerptr(pnum)->objnum), 2, i2f(5) / 2, -1);
 }
 
 }
-#endif
-
-#if defined(DXX_BUILD_DESCENT_II)
-namespace dsx {
 
 void multi_send_sound_function (char whichfunc, char sound)
 {
@@ -4307,6 +4223,8 @@ void multi_send_sound_function (char whichfunc, char sound)
 
 #define AFTERBURNER_LOOP_START  20098
 #define AFTERBURNER_LOOP_END    25776
+
+namespace {
 
 static void multi_do_sound_function (const playernum_t pnum, const ubyte *buf)
 {
@@ -4328,6 +4246,8 @@ static void multi_do_sound_function (const playernum_t pnum, const ubyte *buf)
 		digi_kill_sound_linked_to_object(plobj);
 	else if (whichfunc==3)
 		digi_link_sound_to_object3(sound, plobj, 1, F1_0, sound_stack::allow_stacking, vm_distance{i2f(256)}, AFTERBURNER_LOOP_START, AFTERBURNER_LOOP_END);
+}
+
 }
 
 void multi_send_capture_bonus (const playernum_t pnum)
@@ -4504,6 +4424,8 @@ void multi_send_got_orb (const playernum_t pnum)
 	multi_send_flags (Player_num);
 }
 
+namespace {
+
 static void multi_do_got_flag (const playernum_t pnum)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -4532,7 +4454,6 @@ static void multi_do_got_orb (const playernum_t pnum)
 	objp->ctype.player_info.powerup_flags |= PLAYER_FLAGS_FLAG;
 	HUD_init_message(HM_MULTI, "%s picked up an orb!",static_cast<const char *>(vcplayerptr(pnum)->callsign));
 }
-
 
 static void DropOrb ()
 {
@@ -4570,6 +4491,8 @@ static void DropOrb ()
 		player_info.powerup_flags &=~(PLAYER_FLAGS_FLAG);
 		multi_send_flags (Player_num);
 	}
+}
+
 }
 
 void DropFlag ()
@@ -4646,11 +4569,7 @@ static void multi_do_drop_flag (const playernum_t pnum, const ubyte *buf)
 }
 
 }
-
-}
 #endif
-
-namespace dsx {
 
 uint_fast32_t multi_powerup_is_allowed(const unsigned id, const unsigned AllowedItems)
 {
@@ -4751,6 +4670,8 @@ void multi_send_finish_game ()
 	multi_send_data(multibuf, 2);
 }
 
+namespace {
+
 static void multi_do_finish_game(const uint8_t *const buf)
 {
 	if (buf[0]!=MULTI_FINISH_GAME)
@@ -4762,6 +4683,8 @@ static void multi_do_finish_game(const uint8_t *const buf)
 	do_final_boss_hacks();
 }
 
+}
+
 void multi_send_trigger_specific(const playernum_t pnum, const uint8_t trig)
 {
 	multi_command<MULTI_START_TRIGGER> multibuf;
@@ -4770,17 +4693,19 @@ void multi_send_trigger_specific(const playernum_t pnum, const uint8_t trig)
 	multi_send_data_direct(multibuf, pnum, 2);
 }
 
+namespace {
+
 static void multi_do_start_trigger(const uint8_t *const buf)
 {
 	auto &Triggers = LevelUniqueWallSubsystemState.Triggers;
 	auto &vmtrgptr = Triggers.vmptr;
 	vmtrgptr(static_cast<trgnum_t>(buf[1]))->flags |= trigger_behavior_flags::disabled;
 }
-#endif
 
 }
+#endif
 
-namespace dsx {
+namespace {
 static void multi_adjust_lifetime_ranking(int &k, const int count)
 {
 	if (!(Game_mode & GM_NETWORK))
@@ -4806,6 +4731,9 @@ static void multi_adjust_lifetime_ranking(int &k, const int count)
 }
 }
 
+#if !(!defined(RELEASE) && defined(DXX_BUILD_DESCENT_II))
+namespace {
+#endif
 void multi_add_lifetime_kills(const int count)
 {
 	// This function adds a kill to lifetime stats of this player, and possibly
@@ -4813,7 +4741,11 @@ void multi_add_lifetime_kills(const int count)
 
 	multi_adjust_lifetime_ranking(PlayerCfg.NetlifeKills, count);
 }
+#if !(!defined(RELEASE) && defined(DXX_BUILD_DESCENT_II))
+}
+#endif
 
+namespace {
 void multi_add_lifetime_killed ()
 {
 	// This function adds a "killed" to lifetime stats of this player, and possibly
@@ -4824,6 +4756,10 @@ void multi_add_lifetime_killed ()
 
 	multi_adjust_lifetime_ranking(PlayerCfg.NetlifeKilled, 1);
 }
+}
+}
+
+namespace {
 
 void multi_send_ranking (uint8_t newrank)
 {
@@ -4850,10 +4786,12 @@ static void multi_do_ranking (const playernum_t pnum, const ubyte *buf)
 		HUD_init_message(HM_MULTI, "%s has been %smoted to %s!",static_cast<const char *>(vcplayerptr(pnum)->callsign), rankstr, RankStrings[rank]);
 }
 
+}
+
 namespace dcx {
 
 // Decide if fire from "killer" is friendly. If yes return 1 (no harm to me) otherwise 0 (damage me)
-static int multi_maybe_disable_friendly_fire(const object_base *const killer)
+int multi_maybe_disable_friendly_fire(const object_base *const killer)
 {
 	if (!(Game_mode & GM_NETWORK)) // no Multiplayer game -> always harm me!
 		return 0;
@@ -4873,15 +4811,6 @@ static int multi_maybe_disable_friendly_fire(const object_base *const killer)
 			return 0;
 	}
 	return 0; // all other cases -> harm me!
-}
-
-}
-
-namespace dsx {
-
-int multi_maybe_disable_friendly_fire(const object *const killer)
-{
-	return multi_maybe_disable_friendly_fire(static_cast<const object_base *>(killer));
 }
 
 }
@@ -4936,8 +4865,6 @@ void multi_new_bounty_target(const playernum_t pnum )
 #endif
 }
 
-}
-
 static void multi_do_save_game(const uint8_t *const buf)
 {
 	int count = 1;
@@ -4955,6 +4882,10 @@ static void multi_do_save_game(const uint8_t *const buf)
 
 }
 
+}
+
+namespace {
+
 static void multi_do_restore_game(const ubyte *buf)
 {
 	int count = 1;
@@ -4967,7 +4898,10 @@ static void multi_do_restore_game(const ubyte *buf)
 	multi_restore_game( slot, id );
 }
 
+}
+
 namespace dcx {
+namespace {
 
 static void multi_send_save_game(const d_game_unique_state::save_slot slot, const unsigned id, const d_game_unique_state::savegame_description &desc)
 {
@@ -4994,6 +4928,7 @@ static void multi_send_restore_game(ubyte slot, uint id)
 	multi_send_data(multibuf, 2);
 }
 
+}
 }
 
 namespace dsx {
@@ -5118,7 +5053,7 @@ void multi_restore_game(const unsigned slot, const unsigned id)
 	const auto thisid = state_get_game_id(filename);
 	if (thisid!=id)
 	{
-		nm_messagebox_str(nullptr, nm_messagebox_tie(TXT_OK), "A multi-save game was restored\nthat you are missing or does not\nmatch that of the others.\nYou must rejoin if you wish to\ncontinue.");
+		nm_messagebox_str(menu_title{nullptr}, nm_messagebox_tie(TXT_OK), menu_subtitle{"A multi-save game was restored\nthat you are missing or does not\nmatch that of the others.\nYou must rejoin if you wish to\ncontinue."});
 		return;
 	}
 
@@ -5137,9 +5072,13 @@ void multi_restore_game(const unsigned slot, const unsigned id)
 
 }
 
+namespace {
+
 static void multi_do_msgsend_state(const uint8_t *buf)
 {
 	multi_sending_message[static_cast<int>(buf[1])] = static_cast<msgsend_state_t>(buf[2]);
+}
+
 }
 
 void multi_send_msgsend_state(msgsend_state_t state)
@@ -5150,6 +5089,8 @@ void multi_send_msgsend_state(msgsend_state_t state)
 	
 	multi_send_data(multibuf, 2);
 }
+
+namespace {
 
 // Specific variables related to our game mode we want the clients to know about
 void multi_send_gmode_update()
@@ -5186,6 +5127,8 @@ static void multi_do_gmode_update(const ubyte *buf)
 	{
 		Bounty_target = buf[2]; // accept silently - message about change we SHOULD have gotten due to kill computation
 	}
+}
+
 }
 
 /*
@@ -5232,6 +5175,7 @@ void multi_send_player_inventory(int priority)
 }
 
 namespace dsx {
+namespace {
 static void multi_do_player_inventory(const playernum_t pnum, const ubyte *buf)
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -5276,14 +5220,12 @@ static void multi_do_player_inventory(const playernum_t pnum, const ubyte *buf)
 	player_info.vulcan_ammo = GET_INTEL_SHORT(buf + count); count += 2;
 	player_info.powerup_flags = player_flags(GET_INTEL_INT(buf + count));    count += 4;
 }
-}
 
 /*
  * Count the inventory of the level. Initial (start) or current (now).
  * In 'current', also consider player inventories (and the thief bot).
  * NOTE: We add actual ammo amount - we do not want to count in 'amount of powerups'. Makes it easier to keep track of overhead (proximities, vulcan ammo)
  */
-namespace dsx {
 static void MultiLevelInv_CountLevelPowerups()
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -5369,9 +5311,7 @@ static void MultiLevelInv_CountLevelPowerups()
                 }
         }
 }
-}
 
-namespace dsx {
 static void MultiLevelInv_CountPlayerInventory()
 {
 	auto &Objects = LevelUniqueObjectState.Objects;
@@ -5456,6 +5396,7 @@ static void MultiLevelInv_CountPlayerInventory()
                         }
                 }
 #endif
+}
 }
 }
 
@@ -5545,9 +5486,6 @@ public:
 		reset();
 	}
 };
-
-constexpr std::integral_constant<int, -1> hoard_resources_type::invalid_bm_idx;
-constexpr std::integral_constant<unsigned, ~0u> hoard_resources_type::invalid_snd_idx;
 
 static hoard_resources_type hoard_resources;
 
@@ -6311,139 +6249,216 @@ void multi_object_rw_to_object(object_rw *obj_rw, object &obj)
 	}
 }
 
-static int show_netgame_info_poll( newmenu *menu, const d_event &event, char *ngii  )
-{
-	newmenu_item *menus = newmenu_get_items(menu);
-	switch (event.type)
-	{
-		case EVENT_WINDOW_CLOSE:
-		{
-			d_free(ngii);
-                        d_free(menus);
-			return 0;
-		}
-		default:
-			break;
-	}
-	return 0;
-}
-
 void show_netgame_info(const netgame_info &netgame)
 {
-        char *ngii;
-        newmenu_item *m;
-        int loc=0, ngilen = 50;
-#if defined(DXX_BUILD_DESCENT_I)
-	constexpr unsigned nginum = 50;
-#elif defined(DXX_BUILD_DESCENT_II)
-	constexpr unsigned nginum = 78;
+	struct netgame_info_menu_items
+	{
+		enum netgame_menu_info_index
+		{
+			game_name,
+			mission_name,
+			level_number,
+			game_mode,
+			player_counts,
+			blank_1,
+			game_options_header,
+			difficulty,
+			reactor_life,
+			max_time,
+			kill_goal,
+			blank_2,
+			duplicate_powerups_header,
+			duplicate_primaries,
+			duplicate_secondaries,
+#if defined(DXX_BUILD_DESCENT_II)
+			duplicate_accessories,
 #endif
+			blank_3,
+			spawn_site_header,
+			spawn_count,
+			spawn_invulnerable_time,
+			blank_4,
+			objects_allowed_header,
+			allow_laser_upgrade,
+			allow_quad_laser,
+			allow_vulcan_cannon,
+			allow_spreadfire_cannon,
+			allow_plasma_cannon,
+			allow_fusion_cannon,
+			/* concussion missiles are always allowed, so there is no line
+			 * item for them */
+			allow_homing_missiles,
+			allow_proximity_bombs,
+			allow_smart_missiles,
+			allow_mega_missiles,
+#if defined(DXX_BUILD_DESCENT_II)
+			allow_super_laser_upgrade,
+			allow_gauss_cannon,
+			allow_helix_cannon,
+			allow_phoenix_cannon,
+			allow_omega_cannon,
+			allow_flash_missiles,
+			allow_guided_missiles,
+			allow_smart_mines,
+			allow_mercury_missiles,
+			allow_earthshaker_missiles,
+#endif
+			allow_cloaking,
+			allow_invulnerability,
+#if defined(DXX_BUILD_DESCENT_II)
+			allow_afterburner,
+			allow_ammo_rack,
+			allow_energy_converter,
+			allow_headlight,
+#endif
+			blank_5,
+			objects_granted_header,
+			grant_laser_level,
+			grant_quad_laser,
+			grant_vulcan_cannon,
+			grant_spreadfire_cannon,
+			grant_plasma_cannon,
+			grant_fusion_cannon,
+#if defined(DXX_BUILD_DESCENT_II)
+			grant_gauss_cannon,
+			grant_helix_cannon,
+			grant_phoenix_cannon,
+			grant_omega_cannon,
+			grant_afterburner,
+			grant_ammo_rack,
+			grant_energy_converter,
+			grant_headlight,
+#endif
+			blank_6,
+			misc_options_header,
+			show_all_players_on_automap,
+#if defined(DXX_BUILD_DESCENT_II)
+			allow_marker_camera,
+			indestructible_lights,
+			thief_permitted,
+			thief_steals_energy,
+			guidebot_enabled,
+#endif
+			bright_player_ships,
+			enemy_names_on_hud,
+			friendly_fire,
+			blank_7,
+			network_options_header,
+			packets_per_second,
+		};
+		enum
+		{
+			count_array_elements = static_cast<unsigned>(packets_per_second) + 1
+		};
+		enumerated_array<std::array<char, 50>, count_array_elements, netgame_menu_info_index> lines;
+		enumerated_array<newmenu_item, count_array_elements, netgame_menu_info_index> menu_items;
+		netgame_info_menu_items(const netgame_info &netgame)
+		{
+			for (auto &&[m, l] : zip(menu_items, lines))
+				nm_set_item_text(m, l.data());
 
-        CALLOC(m, newmenu_item, nginum);
-        if (!m)
-                return;
-        MALLOC(ngii, char, nginum * ngilen);
-        if (!ngii)
-        {
-                d_free(m);
-                return;
-        }
+			menu_items[blank_1].text =
+				menu_items[blank_2].text =
+				menu_items[blank_3].text =
+				menu_items[blank_4].text =
+				menu_items[blank_5].text =
+				menu_items[blank_6].text =
+				menu_items[blank_7].text =
+				const_cast<char *>(" ");
 
-        snprintf(ngii+(ngilen*loc),ngilen,"Game Name\t  %s",netgame.game_name.data());                                                                      loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Mission Name\t  %s",netgame.mission_title.data());                                                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Level\t  %s%i", (netgame.levelnum<0)?"S":" ", abs(netgame.levelnum));                                           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Game Mode\t  %s", netgame.gamemode < GMNames.size() ? GMNames[netgame.gamemode] : "INVALID");                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Players\t  %i/%i", netgame.numplayers, netgame.max_numplayers);                                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Game Options:");                                                                                                  loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Difficulty\t  %s", MENU_DIFFICULTY_TEXT(netgame.difficulty));                                                    loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Reactor Life\t  %i %s", netgame.control_invul_time / F1_0 / 60, TXT_MINUTES_ABBREV);                             loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Max Time\t  %i %s", netgame.PlayTimeAllowed.count() / (F1_0 * 60), TXT_MINUTES_ABBREV);                                            loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Kill Goal\t  %i", netgame.KillGoal * 5);                                                                         loc++;
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Duplicate Powerups:");                                                                                            loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Primaries\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_primary_count()));                                           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Secondaries\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_secondary_count()));                                       loc++;
-#if defined(DXX_BUILD_DESCENT_II)
-        snprintf(ngii+(ngilen*loc),ngilen,"Accessories\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_accessory_count()));                                       loc++;
-#endif
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Spawn Options:");                                                                                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Use * Furthest Spawn Sites\t  %i", netgame.SecludedSpawns+1);                                                    loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Invulnerable Time\t  %1.1f sec", static_cast<float>(netgame.InvulAppear) / 2);                                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Objects Allowed:");                                                                                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Laser Upgrade\t  %s", (netgame.AllowedItems & NETFLAG_DOLASER)?TXT_YES:TXT_NO);                                  loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Quad Lasers\t  %s", (netgame.AllowedItems & NETFLAG_DOQUAD)?TXT_YES:TXT_NO);                                     loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Vulcan Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOVULCAN)?TXT_YES:TXT_NO);                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Spreadfire Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOSPREAD)?TXT_YES:TXT_NO);                             loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Plasma Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOPLASMA)?TXT_YES:TXT_NO);                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Fusion Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOFUSION)?TXT_YES:TXT_NO);                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Homing Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOHOMING)?TXT_YES:TXT_NO);                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Proximity Bombs\t  %s", (netgame.AllowedItems & NETFLAG_DOPROXIM)?TXT_YES:TXT_NO);                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Smart Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOSMART)?TXT_YES:TXT_NO);                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Mega Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOMEGA)?TXT_YES:TXT_NO);                                   loc++;
-#if defined(DXX_BUILD_DESCENT_II)
-        snprintf(ngii+(ngilen*loc),ngilen,"Super Lasers\t  %s", (netgame.AllowedItems & NETFLAG_DOSUPERLASER)?TXT_YES:TXT_NO);                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Gauss Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOGAUSS)?TXT_YES:TXT_NO);                                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Helix Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOHELIX)?TXT_YES:TXT_NO);                                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Phoenix Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOPHOENIX)?TXT_YES:TXT_NO);                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Omega Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOOMEGA)?TXT_YES:TXT_NO);                                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Flash Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOFLASH)?TXT_YES:TXT_NO);                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Guides Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOGUIDED)?TXT_YES:TXT_NO);                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Smart Mines\t  %s", (netgame.AllowedItems & NETFLAG_DOSMARTMINE)?TXT_YES:TXT_NO);                                loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Mercury Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOMERCURY)?TXT_YES:TXT_NO);                             loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Earthshaker Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOSHAKER)?TXT_YES:TXT_NO);                          loc++;
-#endif
-        snprintf(ngii+(ngilen*loc),ngilen,"Cloaking\t  %s", (netgame.AllowedItems & NETFLAG_DOCLOAK)?TXT_YES:TXT_NO);                                       loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Invulnerability\t  %s", (netgame.AllowedItems & NETFLAG_DOINVUL)?TXT_YES:TXT_NO);                                loc++;
-#if defined(DXX_BUILD_DESCENT_II)
-        snprintf(ngii+(ngilen*loc),ngilen,"Afterburners\t  %s", (netgame.AllowedItems & NETFLAG_DOAFTERBURNER)?TXT_YES:TXT_NO);                             loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Ammo Rack\t  %s", (netgame.AllowedItems & NETFLAG_DOAMMORACK)?TXT_YES:TXT_NO);                                   loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Enery Converter\t  %s", (netgame.AllowedItems & NETFLAG_DOCONVERTER)?TXT_YES:TXT_NO);                            loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Headlight\t  %s", (netgame.AllowedItems & NETFLAG_DOHEADLIGHT)?TXT_YES:TXT_NO);                                  loc++;
-#endif
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Objects Granted At Spawn:");                                                                                      loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Laser Level\t  %u", static_cast<unsigned>(map_granted_flags_to_laser_level(netgame.SpawnGrantedItems)) + 1);                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Quad Lasers\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_QUAD)?TXT_YES:TXT_NO);             loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Vulcan Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_VULCAN)?TXT_YES:TXT_NO);         loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Spreadfire Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_SPREAD)?TXT_YES:TXT_NO);     loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Plasma Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_PLASMA)?TXT_YES:TXT_NO);         loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Fusion Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_FUSION)?TXT_YES:TXT_NO);         loc++;
-#if defined(DXX_BUILD_DESCENT_II)
-        snprintf(ngii+(ngilen*loc),ngilen,"Gauss Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_GAUSS)?TXT_YES:TXT_NO);           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Helix Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_HELIX)?TXT_YES:TXT_NO);           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Phoenix Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_PHOENIX)?TXT_YES:TXT_NO);       loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Omega Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_OMEGA)?TXT_YES:TXT_NO);           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Afterburners\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_AFTERBURNER)?TXT_YES:TXT_NO);     loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Ammo Rack\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_AMMORACK)?TXT_YES:TXT_NO);           loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Enery Converter\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_CONVERTER)?TXT_YES:TXT_NO);    loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Headlight\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_HEADLIGHT)?TXT_YES:TXT_NO);          loc++;
-#endif
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Misc. Options:");                                                                                                 loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Show All Players On Automap\t  %s", netgame.game_flag.show_on_map?TXT_YES:TXT_NO);                               loc++;
-#if defined(DXX_BUILD_DESCENT_II)
-        snprintf(ngii+(ngilen*loc),ngilen,"Allow Marker Camera Views\t  %s", netgame.Allow_marker_view?TXT_YES:TXT_NO);                                     loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Indestructible Lights\t  %s", netgame.AlwaysLighting?TXT_YES:TXT_NO);                                            loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Thief permitted\t  %s", (netgame.ThiefModifierFlags & ThiefModifier::Absent) ? TXT_NO : TXT_YES);                                            loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Thief steals energy weapons\t  %s", (netgame.ThiefModifierFlags & ThiefModifier::NoEnergyWeapons) ? TXT_NO : TXT_YES);                                            loc++;
-	snprintf(ngii+(ngilen*loc),ngilen,"Guidebot enabled (experimental)\t  %s", Netgame.AllowGuidebot ? TXT_YES : TXT_NO);                                            loc++;
-#endif
-        snprintf(ngii+(ngilen*loc),ngilen,"Bright Player Ships\t  %s", netgame.BrightPlayers?TXT_YES:TXT_NO);                                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Enemy Names On Hud\t  %s", netgame.ShowEnemyNames?TXT_YES:TXT_NO);                                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Friendly Fire (Team, Coop)\t  %s", netgame.NoFriendlyFire?TXT_NO:TXT_YES);                                       loc++;
-        snprintf(ngii+(ngilen*loc),ngilen," ");                                                                                                              loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Network Options:");                                                                                               loc++;
-        snprintf(ngii+(ngilen*loc),ngilen,"Packets Per Second\t  %i", netgame.PacketsPerSec);                                                               loc++;
+			menu_items[game_options_header].text = const_cast<char *>("Game Options:");
+			menu_items[duplicate_powerups_header].text = const_cast<char *>("Duplicate Powerups:");
+			menu_items[spawn_site_header].text = const_cast<char *>("Spawn Options:");
+			menu_items[objects_allowed_header].text = const_cast<char *>("Objects Allowed:");
+			menu_items[objects_granted_header].text = const_cast<char *>("Objects Granted At Spawn:");
+			menu_items[misc_options_header].text = const_cast<char *>("Misc. Options:");
+			menu_items[network_options_header].text = const_cast<char *>("Network Options:");
 
-        Assert(loc == nginum);
-	for (int i = 0; i < nginum; i++) {
-                m[i].type = NM_TYPE_TEXT;
-                m[i].text = ngii+(i*ngilen);
-	}
-
-	newmenu_dotiny(nullptr, "Netgame Info & Rules", unchecked_partial_range(m, nginum), tab_processing_flag::ignore, show_netgame_info_poll, ngii);
+			array_snprintf(lines[game_name], "Game Name\t  %s", netgame.game_name.data());
+			array_snprintf(lines[mission_name], "Mission Name\t  %s", netgame.mission_title.data());
+			array_snprintf(lines[level_number], "Level\t  %s%i", (netgame.levelnum < 0) ? "S" : " ", abs(netgame.levelnum));
+			array_snprintf(lines[game_mode], "Game Mode\t  %s", netgame.gamemode < GMNames.size() ? GMNames[netgame.gamemode] : "INVALID");
+			array_snprintf(lines[player_counts], "Players\t  %i/%i", netgame.numplayers, netgame.max_numplayers);
+			array_snprintf(lines[difficulty], "Difficulty\t  %s", MENU_DIFFICULTY_TEXT(netgame.difficulty));
+			array_snprintf(lines[reactor_life], "Reactor Life\t  %i %s", netgame.control_invul_time / F1_0 / 60, TXT_MINUTES_ABBREV);
+			array_snprintf(lines[max_time], "Max Time\t  %i %s", netgame.PlayTimeAllowed.count() / (F1_0 * 60), TXT_MINUTES_ABBREV);
+			array_snprintf(lines[kill_goal], "Kill Goal\t  %i", netgame.KillGoal * 5);
+			array_snprintf(lines[duplicate_primaries], "Primaries\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_primary_count()));
+			array_snprintf(lines[duplicate_secondaries], "Secondaries\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_secondary_count()));
+#if defined(DXX_BUILD_DESCENT_II)
+			array_snprintf(lines[duplicate_accessories], "Accessories\t  %i", static_cast<int>(netgame.DuplicatePowerups.get_accessory_count()));
+#endif
+			array_snprintf(lines[spawn_count], "Use * Furthest Spawn Sites\t  %i", netgame.SecludedSpawns+1);
+			array_snprintf(lines[spawn_invulnerable_time], "Invulnerable Time\t  %1.1f sec", static_cast<float>(netgame.InvulAppear) / 2);
+			array_snprintf(lines[allow_laser_upgrade], "Laser Upgrade\t  %s", (netgame.AllowedItems & NETFLAG_DOLASER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_quad_laser], "Quad Lasers\t  %s", (netgame.AllowedItems & NETFLAG_DOQUAD)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_vulcan_cannon], "Vulcan Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOVULCAN)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_spreadfire_cannon], "Spreadfire Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOSPREAD)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_plasma_cannon], "Plasma Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOPLASMA)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_fusion_cannon], "Fusion Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOFUSION)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_homing_missiles], "Homing Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOHOMING)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_proximity_bombs], "Proximity Bombs\t  %s", (netgame.AllowedItems & NETFLAG_DOPROXIM)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_smart_missiles], "Smart Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOSMART)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_mega_missiles], "Mega Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOMEGA)?TXT_YES:TXT_NO);
+#if defined(DXX_BUILD_DESCENT_II)
+			array_snprintf(lines[allow_super_laser_upgrade], "Super Lasers\t  %s", (netgame.AllowedItems & NETFLAG_DOSUPERLASER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_gauss_cannon], "Gauss Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOGAUSS)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_helix_cannon], "Helix Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOHELIX)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_phoenix_cannon], "Phoenix Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOPHOENIX)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_omega_cannon], "Omega Cannon\t  %s", (netgame.AllowedItems & NETFLAG_DOOMEGA)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_flash_missiles], "Flash Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOFLASH)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_guided_missiles], "Guided Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOGUIDED)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_smart_mines], "Smart Mines\t  %s", (netgame.AllowedItems & NETFLAG_DOSMARTMINE)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_mercury_missiles], "Mercury Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOMERCURY)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_earthshaker_missiles], "Earthshaker Missiles\t  %s", (netgame.AllowedItems & NETFLAG_DOSHAKER)?TXT_YES:TXT_NO);
+#endif
+			array_snprintf(lines[allow_cloaking], "Cloaking\t  %s", (netgame.AllowedItems & NETFLAG_DOCLOAK)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_invulnerability], "Invulnerability\t  %s", (netgame.AllowedItems & NETFLAG_DOINVUL)?TXT_YES:TXT_NO);
+#if defined(DXX_BUILD_DESCENT_II)
+			array_snprintf(lines[allow_afterburner], "Afterburners\t  %s", (netgame.AllowedItems & NETFLAG_DOAFTERBURNER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_ammo_rack], "Ammo Rack\t  %s", (netgame.AllowedItems & NETFLAG_DOAMMORACK)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_energy_converter], "Energy Converter\t  %s", (netgame.AllowedItems & NETFLAG_DOCONVERTER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[allow_headlight], "Headlight\t  %s", (netgame.AllowedItems & NETFLAG_DOHEADLIGHT)?TXT_YES:TXT_NO);
+#endif
+			array_snprintf(lines[grant_laser_level], "Laser Level\t  %u", static_cast<unsigned>(map_granted_flags_to_laser_level(netgame.SpawnGrantedItems)) + 1);
+			array_snprintf(lines[grant_quad_laser], "Quad Lasers\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_QUAD)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_vulcan_cannon], "Vulcan Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_VULCAN)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_spreadfire_cannon], "Spreadfire Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_SPREAD)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_plasma_cannon], "Plasma Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_PLASMA)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_fusion_cannon], "Fusion Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_FUSION)?TXT_YES:TXT_NO);
+#if defined(DXX_BUILD_DESCENT_II)
+			array_snprintf(lines[grant_gauss_cannon], "Gauss Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_GAUSS)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_helix_cannon], "Helix Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_HELIX)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_phoenix_cannon], "Phoenix Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_PHOENIX)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_omega_cannon], "Omega Cannon\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_OMEGA)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_afterburner], "Afterburner\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_AFTERBURNER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_ammo_rack], "Ammo Rack\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_AMMORACK)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_energy_converter], "Energy Converter\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_CONVERTER)?TXT_YES:TXT_NO);
+			array_snprintf(lines[grant_headlight], "Headlight\t  %s", menu_bit_wrapper(netgame.SpawnGrantedItems.mask, NETGRANT_HEADLIGHT)?TXT_YES:TXT_NO);
+#endif
+			array_snprintf(lines[show_all_players_on_automap], "Show All Players On Automap\t  %s", netgame.game_flag.show_on_map?TXT_YES:TXT_NO);
+#if defined(DXX_BUILD_DESCENT_II)
+			array_snprintf(lines[allow_marker_camera], "Allow Marker Camera Views\t  %s", netgame.Allow_marker_view?TXT_YES:TXT_NO);
+			array_snprintf(lines[indestructible_lights], "Indestructible Lights\t  %s", netgame.AlwaysLighting?TXT_YES:TXT_NO);
+			array_snprintf(lines[thief_permitted], "Thief permitted\t  %s", (netgame.ThiefModifierFlags & ThiefModifier::Absent) ? TXT_NO : TXT_YES);
+			array_snprintf(lines[thief_steals_energy], "Thief steals energy weapons\t  %s", (netgame.ThiefModifierFlags & ThiefModifier::NoEnergyWeapons) ? TXT_NO : TXT_YES);
+			array_snprintf(lines[guidebot_enabled], "Guidebot enabled (experimental)\t  %s", Netgame.AllowGuidebot ? TXT_YES : TXT_NO);
+#endif
+			array_snprintf(lines[bright_player_ships], "Bright Player Ships\t  %s", netgame.BrightPlayers?TXT_YES:TXT_NO);
+			array_snprintf(lines[enemy_names_on_hud], "Enemy Names On Hud\t  %s", netgame.ShowEnemyNames?TXT_YES:TXT_NO);
+			array_snprintf(lines[friendly_fire], "Friendly Fire (Team, Coop)\t  %s", netgame.NoFriendlyFire?TXT_NO:TXT_YES);
+			array_snprintf(lines[packets_per_second], "Packets Per Second\t  %i", netgame.PacketsPerSec);
+		}
+	};
+	struct netgame_info_menu : netgame_info_menu_items, passive_newmenu
+	{
+		netgame_info_menu(const netgame_info &netgame, grs_canvas &src) :
+			netgame_info_menu_items(netgame),
+			passive_newmenu(menu_title{nullptr}, menu_subtitle{"Netgame Info & Rules"}, menu_filename{nullptr}, tiny_mode_flag::tiny, tab_processing_flag::ignore, adjusted_citem::create(menu_items, 0), src)
+			{
+			}
+	};
+	auto menu = window_create<netgame_info_menu>(netgame, grd_curscreen->sc_canvas);
+	(void)menu;
 }
 }

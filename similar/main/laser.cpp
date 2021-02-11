@@ -324,11 +324,12 @@ static imobjptridx_t create_weapon_object(int weapon_type,const vmsegptridx_t se
 	obj->mtype.phys_info.drag = Weapon_info[weapon_type].drag;
 	vm_vec_zero(obj->mtype.phys_info.thrust);
 
-	if (Weapon_info[weapon_type].bounce==1)
+	const auto bounce = Weapon_info[weapon_type].bounce;
+	if (bounce == weapon_info::bounce_type::always)
 		obj->mtype.phys_info.flags |= PF_BOUNCE;
 
 #if defined(DXX_BUILD_DESCENT_II)
-	if (Weapon_info[weapon_type].bounce==2 || cheats.bouncyfire)
+	if (bounce == weapon_info::bounce_type::twice || cheats.bouncyfire)
 		obj->mtype.phys_info.flags |= PF_BOUNCE+PF_BOUNCES_TWICE;
 #endif
 
@@ -2314,8 +2315,8 @@ void do_missile_firing(int drop_bomb)
 	fix fire_frame_overhead = 0;
 
 	auto &plrobj = get_local_plrobj();
-	const auto bomb = which_bomb();
 	auto &player_info = plrobj.ctype.player_info;
+	const auto bomb = which_bomb(player_info);
 	const auto weapon = drop_bomb ? bomb : player_info.Secondary_weapon;
 	assert(weapon < MAX_SECONDARY_WEAPONS);
 	auto &Next_missile_fire_time = player_info.Next_missile_fire_time;

@@ -55,7 +55,6 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include <sys/time.h>
 #endif
 
-#ifdef __cplusplus
 #include <stdexcept>
 #include "digi.h"
 #include "pack.h"
@@ -236,24 +235,56 @@ constexpr std::integral_constant<unsigned, 21> MULTI_ALLOW_POWERUP_TEXT_LENGTH{}
 	VALUE(NETGRANT_HEADLIGHT, NETFLAG_LABEL_HEADLIGHT)
 
 #endif
+
+namespace multi {
+struct dispatch_table
+{
+	constexpr const dispatch_table *operator->() const
+	{
+		return this;
+	}
+	virtual int objnum_is_past(objnum_t objnum) const = 0;
+	virtual void do_protocol_frame(int force, int listen) const = 0;
+	virtual window_event_result level_sync() const = 0;
+	virtual void send_endlevel_packet() const = 0;
+	virtual void kick_player(const _sockaddr &dump_addr, int why) const = 0;
+	virtual void disconnect_player(int playernum) const = 0;
+	virtual int end_current_level(int *secret) const = 0;
+	virtual void leave_game() const = 0;
+};
+}
 }
 
 #define define_netflag_bit_enum(NAME,STR)	BIT_##NAME,
-#define define_netflag_bit_mask(NAME,STR)	static constexpr auto NAME = std::integral_constant<unsigned, (1 << BIT_##NAME)>{};
+#define define_netflag_bit_mask(NAME,STR)	NAME = (1 << BIT_##NAME),
 #define define_netflag_powerup_mask(NAME,STR)	| (NAME)
 enum { for_each_netflag_value(define_netflag_bit_enum) };
 // Bitmask for netgame_info->AllowedItems to set allowed items in Netgame
-for_each_netflag_value(define_netflag_bit_mask);
-enum { NETFLAG_DOPOWERUP = 0 for_each_netflag_value(define_netflag_powerup_mask) };
+enum netflag_flag :
+#if defined(DXX_BUILD_DESCENT_I)
+	uint16_t
+#elif defined(DXX_BUILD_DESCENT_II)
+	uint32_t
+#endif
+{
+	for_each_netflag_value(define_netflag_bit_mask)
+};
 enum {
 	BIT_NETGRANT_LASER = DXX_GRANT_LASER_LEVEL_BITS - 1,
 	for_each_netgrant_value(define_netflag_bit_enum)
 	BIT_NETGRANT_MAXIMUM
 };
-for_each_netgrant_value(define_netflag_bit_mask);
+enum netgrant_flag :
+#if defined(DXX_BUILD_DESCENT_I)
+	uint8_t
+#elif defined(DXX_BUILD_DESCENT_II)
+	uint16_t
+#endif
+{
+	for_each_netgrant_value(define_netflag_bit_mask)
+};
 #undef define_netflag_bit_enum
 #undef define_netflag_bit_mask
-#undef define_netflag_powerup_mask
 
 namespace dsx {
 
@@ -366,6 +397,7 @@ extern const std::array<char[8], MULTI_GAME_TYPE_COUNT> GMNamesShrt;
 namespace dcx {
 extern std::array<objnum_t, MAX_NET_CREATE_OBJECTS> Net_create_objnums;
 extern unsigned Net_create_loc;
+int multi_maybe_disable_friendly_fire(const object_base *attacker);
 }
 
 namespace dsx {
@@ -378,7 +410,6 @@ void multi_send_remobj(vmobjidx_t objnum);
 void multi_send_door_open(vcsegidx_t segnum, unsigned side, uint8_t flag);
 void multi_send_drop_weapon(vmobjptridx_t objnum,int seed);
 void multi_reset_player_object(object &objp);
-int multi_maybe_disable_friendly_fire(const object *killer);
 }
 #endif
 
@@ -409,11 +440,9 @@ owned_remote_objnum objnum_local_to_remote(objnum_t local);
 void map_objnum_local_to_remote(int local, int remote, int owner);
 void map_objnum_local_to_local(objnum_t objnum);
 void reset_network_objects();
-int multi_objnum_is_past(objnum_t objnum);
 void multi_do_ping_frame();
 
 void multi_init_objects(void);
-void multi_do_protocol_frame(int force, int listen);
 window_event_result multi_do_frame();
 
 #ifdef dsx
@@ -463,21 +492,17 @@ void multi_send_orb_bonus(playernum_t pnum, uint8_t);
 void multi_send_got_orb(playernum_t pnum);
 void multi_send_effect_blowup(vcsegidx_t segnum, unsigned side, const vms_vector &pnt);
 void multi_send_vulcan_weapon_ammo_adjust(const vmobjptridx_t objnum);
-}
 #ifndef RELEASE
 void multi_add_lifetime_kills(int count);
 #endif
+}
 #endif
 void multi_send_bounty( void );
 
 void multi_consistency_error(int reset);
 window_event_result multi_level_sync();
-int multi_endlevel(int *secret);
-using multi_endlevel_poll = int(newmenu *menu,const d_event &event, const unused_newmenu_userdata_t *);
-void multi_send_endlevel_packet();
 #ifdef dsx
 namespace dsx {
-multi_endlevel_poll *get_multi_endlevel_poll2();
 void multi_send_hostage_door_status(vcwallptridx_t wallnum);
 void multi_prep_level_objects(const d_vclip_array &Vclip);
 void multi_prep_level_player();
@@ -691,7 +716,7 @@ namespace dsx {
 extern void multi_send_stolen_items();
 void multi_send_trigger_specific(playernum_t pnum, uint8_t trig);
 void multi_send_door_open_specific(playernum_t pnum, vcsegidx_t segnum, unsigned side, uint8_t flag);
-void multi_send_wall_status_specific(playernum_t pnum,uint16_t wallnum,ubyte type,ubyte flags,ubyte state);
+void multi_send_wall_status_specific(playernum_t pnum, wallnum_t wallnum, uint8_t type, uint8_t flags, uint8_t state);
 void multi_send_light_specific (playernum_t pnum, vcsegptridx_t segnum, uint8_t val);
 void multi_send_capture_bonus (playernum_t pnum);
 int multi_all_players_alive(const fvcobjptr &, partial_range_t<const player *>);
@@ -760,6 +785,8 @@ namespace dsx {
  */
 struct netgame_info : prohibit_void_ptr<netgame_info>
 {
+	static constexpr std::integral_constant<unsigned, (0 for_each_netflag_value(define_netflag_powerup_mask))> MaskAllKnownAllowedItems{};
+#undef define_netflag_powerup_mask
 	using play_time_allowed_abi_ratio = std::ratio<5 * 60>;
 #if DXX_USE_UDP
 	union
@@ -846,8 +873,6 @@ struct multi_level_inv
         std::array<uint32_t, MAX_POWERUP_TYPES> Current; // current count of this powerup type
         std::array<fix, MAX_POWERUP_TYPES> RespawnTimer; // incremented by FrameTime if initial-current > 0 and triggers respawn after 2 seconds. Since we deal with a certain delay from clients, their inventory updates may happen a while after they remove the powerup object and we do not want to respawn it on accident during that time window!
 };
-}
-#endif
 
 namespace multi
 {
@@ -866,6 +891,8 @@ namespace multi
 		}
 	};
 }
+}
+#endif
 
 /* Stub for mods that remap player colors */
 static inline unsigned get_player_color(unsigned pnum)
@@ -884,5 +911,3 @@ static inline unsigned get_player_or_team_color(unsigned pnum)
 		? get_team_color(get_team(pnum))
 		: get_player_color(pnum);
 }
-
-#endif

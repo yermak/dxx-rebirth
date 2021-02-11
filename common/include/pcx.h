@@ -52,11 +52,12 @@ enum class pcx_result
 // If palette==NULL the palette isn't read in.  Returns error code.
 
 pcx_result pcx_read_bitmap(const char * filename, grs_main_bitmap &bmp, palette_array_t &palette);
+pcx_result pcx_read_bitmap_or_default(const char * filename, grs_main_bitmap &bmp, palette_array_t &palette);
 
 // Writes the bitmap bmp to filename, using palette. Returns error code.
 
 #if !DXX_USE_OGL && DXX_USE_SCREENSHOT_FORMAT_LEGACY
-pcx_result pcx_write_bitmap(PHYSFS_File *, const grs_bitmap *bmp, palette_array_t &palette);
+unsigned pcx_write_bitmap(PHYSFS_File *, const grs_bitmap *bmp, palette_array_t &palette);
 #endif
 
 const char *pcx_errormsg(pcx_result error_number);

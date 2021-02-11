@@ -119,19 +119,12 @@ void do_powerup_frame(const d_vclip_array &Vclip, const vmobjptridx_t obj)
 	}
 }
 
-}
-
-namespace dcx {
-
 void draw_powerup(const d_vclip_array &Vclip, grs_canvas &canvas, const object_base &obj)
 {
 	auto &vci = obj.rtype.vclip_info;
 	draw_object_blob(canvas, obj, Vclip[vci.vclip_num].frames[vci.framenum]);
 }
 
-}
-
-namespace dsx {
 namespace {
 
 static void _powerup_basic_nonhud(int redadd, int greenadd, int blueadd, int score)
@@ -225,7 +218,7 @@ static int pick_up_energy(player_info &player_info)
 	return used;
 }
 
-static int pick_up_primary_or_energy(player_info &player_info, int weapon_index)
+static int pick_up_primary_or_energy(player_info &player_info, const primary_weapon_index_t weapon_index)
 {
 	const auto used = pick_up_primary(player_info, weapon_index);
 	if (used || (Game_mode & GM_MULTI))

@@ -88,7 +88,22 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 		vclip,
 		None = 0xff,
 	};
+	// Flag: set if this object is matter (as opposed to energy)
+	enum class matter_flag : uint8_t
+	{
+		energy,
+		matter,
+	};
+	//	Flag: set if this object bounces off walls
+	enum class bounce_type : uint8_t
+	{
+		never,
+		always,
+		twice,
+	};
 	render_type render;        // How to draw 0=laser, 1=blob, 2=object
+	matter_flag matter;
+	bounce_type bounce;
 #if defined(DXX_BUILD_DESCENT_I)
 	sbyte	model_num;					// Model num if rendertype==2.
 	sbyte	model_num_inner;			// Model num of inner part if rendertype==2.
@@ -106,8 +121,6 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 
 	sbyte   weapon_vclip;       // Vclip to render for the weapon, itself.
 	sbyte   destroyable;        // If !0, this weapon can be destroyed by another weapon.
-	sbyte   matter;             // Flag: set if this object is matter (as opposed to energy)
-	sbyte	bounce;						//	Flag: set if this object bounces off walls
 
 	sbyte   homing_flag;        // Set if this weapon can home in on a target.
 	sbyte	dum1, dum2, dum3;
@@ -150,8 +163,6 @@ struct weapon_info : prohibit_void_ptr<weapon_info>
 	short   wall_hit_sound;     // What sound for impact with wall
 
 	sbyte   destroyable;        // If !0, this weapon can be destroyed by another weapon.
-	sbyte   matter;             // Flag: set if this object is matter (as opposed to energy)
-	sbyte   bounce;             // 1==always bounces, 2=bounces twice
 	sbyte   homing_flag;        // Set if this weapon can home in on a target.
 
 	ubyte   speedvar;           // allowed variance in speed below average, /128: 64 = 50% meaning if speed = 100, can be 50..100
@@ -265,8 +276,7 @@ public:
 namespace dsx {
 //return which bomb will be dropped next time the bomb key is pressed
 #if defined(DXX_BUILD_DESCENT_I)
-
-static constexpr int which_bomb()
+static constexpr secondary_weapon_index_t which_bomb(const player_info &)
 {
 	return PROXIMITY_INDEX;
 }
@@ -287,7 +297,8 @@ static constexpr unsigned vulcan_ammo_scale(const unsigned v)
 	return (v * 0xcc180u) >> 16;
 }
 #elif defined(DXX_BUILD_DESCENT_II)
-int which_bomb(void);
+secondary_weapon_index_t which_bomb(player_info &player_info);
+secondary_weapon_index_t which_bomb(const player_info &player_info);
 
 static constexpr int weapon_index_uses_vulcan_ammo(const unsigned id)
 {

@@ -42,6 +42,8 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 
 namespace dcx {
 
+namespace {
+
 static void gr_bm_ubitblt00_rle(unsigned w, unsigned h, int dx, int dy, int sx, int sy, const grs_bitmap &src, grs_bitmap &dest);
 #if !DXX_USE_OGL
 static void gr_bm_ubitblt00m_rle(unsigned w, unsigned h, int dx, int dy, int sx, int sy, const grs_bitmap &src, grs_bitmap &dest);
@@ -78,7 +80,7 @@ static void gr_for_each_bitmap_line(grs_canvas &canvas, const unsigned x, const 
 
 static void gr_ubitmap00(grs_canvas &canvas, const unsigned x, const unsigned y, const grs_bitmap &bm)
 {
-#if defined(WIN32) && defined(__GNUC__) && (__GNUC__ >= 6 && __GNUC__ <= 9)
+#if defined(WIN32) && defined(__GNUC__) && (__GNUC__ >= 6 && __GNUC__ <= 10)
 /*
  * When using memcpy directly, i686-w64-mingw32-g++-6.3.0 fails to
  * deduce the template instantiation correctly, leading to a compiler
@@ -92,6 +94,7 @@ static void gr_ubitmap00(grs_canvas &canvas, const unsigned x, const unsigned y,
  * Known affected:
  * - i686-w64-mingw32-g++-6.3.0
  * - i686-w64-mingw32-g++-7.3.0
+ * - i686-w64-mingw32-g++-10.2.0
  *
  * Restrict this workaround to known broken versions.
  */
@@ -176,6 +179,8 @@ static void gr_ubitmapGENERICm(grs_canvas &canvas, const unsigned x, const unsig
 }
 #endif
 
+}
+
 void gr_ubitmap(grs_canvas &canvas, grs_bitmap &bm)
 {
 	const unsigned x = 0;
@@ -229,6 +234,8 @@ void gr_ubitmapm(grs_canvas &canvas, const unsigned x, const unsigned y, grs_bit
 	}
 }
 
+namespace {
+
 // From Linear to Linear
 static void gr_bm_ubitblt00(const unsigned w, const unsigned h, const unsigned dx, const unsigned dy, const unsigned sx, const unsigned sy, const grs_bitmap &src, grs_bitmap &dest)
 {
@@ -263,6 +270,8 @@ static void gr_bm_ubitblt00m(const unsigned w, const uint_fast32_t h, const unsi
 			dbits += dest.bm_rowsize;
 		}
 	}
+}
+
 }
 
 void gr_bm_ubitblt(grs_canvas &canvas, const unsigned w, const unsigned h, const int dx, const int dy, const int sx, const int sy, const grs_bitmap &src)
@@ -408,8 +417,6 @@ void bm_rle_window::apply(const uint_fast32_t w, const uint_fast32_t h, const ui
 	}
 }
 
-}
-
 static void gr_bm_ubitblt00_rle(const unsigned w, const unsigned h, const int dx, const int dy, const int sx, const int sy, const grs_bitmap &src, grs_bitmap &dest)
 {
 	bm_rle_window bw(src);
@@ -478,6 +485,8 @@ inside:
 		}
 		s += src.bm_rowsize;
 	}
+}
+
 }
 
 void show_fullscr(grs_canvas &canvas, grs_bitmap &bm)

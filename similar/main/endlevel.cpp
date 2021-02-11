@@ -62,7 +62,7 @@ COPYRIGHT 1993-1999 PARALLAX SOFTWARE CORPORATION.  ALL RIGHTS RESERVED.
 #include "gameseq.h"
 #include "newdemo.h"
 #include "gamepal.h"
-#include "multi.h"
+#include "net_udp.h"
 #include "vclip.h"
 #include "fireball.h"
 #include "text.h"
@@ -517,14 +517,13 @@ constexpr std::array<const char, 24> movie_table{{
 	'M','O','M','O',
 	'P','Q','P','Q'
 }};
-static int endlevel_movie_played = MOVIE_NOT_PLAYED;
+static auto endlevel_movie_played = movie_play_status::skipped;
 
 #define MOVIE_REQUIRED 1
 
 //returns movie played status.  see movie.h
-static int start_endlevel_movie()
+static movie_play_status start_endlevel_movie()
 {
-	int r;
 	palette_array_t save_pal;
 
 	//Assert(PLAYING_BUILTIN_MISSION); //only play movie for built-in mission
@@ -534,27 +533,24 @@ static int start_endlevel_movie()
 
 	const auto current_level_num = Current_level_num;
 	if (is_SHAREWARE)
-		return 0;
+		return movie_play_status::skipped;
 	if (!is_D2_OEM)
 		if (current_level_num == Last_level)
-			return 1;   //don't play movie
+			return movie_play_status::started;   //don't play movie
 
 	if (!(current_level_num > 0))
-		return 0;       //no escapes for secret level
+		return movie_play_status::skipped;       //no escapes for secret level
 	char movie_name[] = "ESA.MVE";
 	movie_name[2] = movie_table[Current_level_num-1];
 
 	save_pal = gr_palette;
 
-	r=PlayMovie(NULL, movie_name,(Game_mode & GM_MULTI)?0:MOVIE_REQUIRED);
-
+	const auto r = PlayMovie(NULL, movie_name,(Game_mode & GM_MULTI)?0:MOVIE_REQUIRED);
 	if (Newdemo_state == ND_STATE_PLAYBACK) {
 		set_screen_mode(SCREEN_GAME);
 		gr_palette = save_pal;
 	}
-
 	return (r);
-
 }
 #endif
 
@@ -713,7 +709,7 @@ window_event_result start_endlevel_sequence()
 
 	if (Game_mode & GM_MULTI) {
 		multi_send_endlevel_start(multi_endlevel_type::normal);
-		multi_do_protocol_frame(1, 1);
+		multi::dispatch->do_protocol_frame(1, 1);
 	}
 
 #if defined(DXX_BUILD_DESCENT_I)
@@ -728,7 +724,7 @@ window_event_result start_endlevel_sequence()
 			window_set_visible(*Game_wind, 1);
 		}
 
-	if (!(!(Game_mode & GM_MULTI) && (endlevel_movie_played == MOVIE_NOT_PLAYED) && endlevel_data_loaded))
+	if (!(!(Game_mode & GM_MULTI) && (endlevel_movie_played == movie_play_status::skipped) && endlevel_data_loaded))
 #endif
 	{
 
@@ -764,7 +760,7 @@ window_event_result start_endlevel_sequence()
 
 	if (Game_mode & GM_MULTI) {
 		multi_send_endlevel_start(multi_endlevel_type::normal);
-		multi_do_protocol_frame(1, 1);
+		multi::dispatch->do_protocol_frame(1, 1);
 	}
 	songs_play_song( SONG_ENDLEVEL, 0 );
 
@@ -943,7 +939,7 @@ window_event_result do_endlevel_frame()
 			if (ConsoleObject->segnum == PlayerUniqueEndlevelState.transition_segnum)
 			{
 #if defined(DXX_BUILD_DESCENT_II)
-				if (PLAYING_BUILTIN_MISSION && endlevel_movie_played != MOVIE_NOT_PLAYED)
+				if (PLAYING_BUILTIN_MISSION && endlevel_movie_played != movie_play_status::skipped)
 					result = std::max(stop_endlevel_sequence(), result);
 				else
 #endif

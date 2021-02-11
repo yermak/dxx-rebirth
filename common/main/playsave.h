@@ -38,6 +38,15 @@ enum class MissileViewMode : uint8_t
 	EnabledSelfOnly,
 	EnabledSelfAndAllies,
 };
+
+enum class cockpit_3d_view : uint8_t
+{
+	None,
+	Escort,
+	Rear,
+	Coop,
+	Marker,
+};
 #endif
 
 #include "gameplayopt.h"
@@ -81,6 +90,8 @@ struct hli
 #include "fwd-weapon.h"
 #include "d_array.h"
 
+namespace dcx {
+
 enum class FiringAutoselectMode : uint8_t
 {
 	Immediate,
@@ -108,6 +119,10 @@ enum MouselookMode : uint8_t
 	MPCoop = 2,
 	MPAnarchy = 4,
 };
+
+}
+
+namespace dsx {
 
 struct player_config : prohibit_void_ptr<player_config>
 {
@@ -143,7 +158,10 @@ struct player_config : prohibit_void_ptr<player_config>
 	int MouseFSIndicator;
 	std::array<cockpit_mode_t, 2> CockpitMode; // 0 saves the "real" cockpit, 1 also saves letterbox and rear. Used to properly switch between modes and restore the real one.
 #if defined(DXX_BUILD_DESCENT_II)
-	enumerated_array<int, 2, gauge_inset_window_view> Cockpit3DView;
+	enumerated_array<cockpit_3d_view, 2, gauge_inset_window_view> Cockpit3DView = {{{
+		cockpit_3d_view::None,
+		cockpit_3d_view::None,
+	}}};
 #endif
 	std::array<ntstring<MAX_MESSAGE_LEN - 1>, 4> NetworkMessageMacro;
 	int NetlifeKills;
@@ -188,6 +206,8 @@ struct player_config : prohibit_void_ptr<player_config>
 	int DynLightColor;
 	d_sp_gameplay_options SPGameplayOptions;
 };
+
+}
 #endif
 
 extern struct player_config PlayerCfg;
@@ -204,7 +224,7 @@ extern const struct player_config::KeySettings DefaultKeySettings;
 
 void write_player_file();
 
-int new_player_config();
+void new_player_config();
 
 int read_player_file();
 
